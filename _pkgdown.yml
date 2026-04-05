@@ -1,0 +1,67 @@
+url: https://raredonlab.github.io/TissueField/
+
+template:
+  bootstrap: 5
+  bootswatch: flatly
+  bslib:
+    primary: "#1a5fa8"
+    link-color: "#1a5fa8"
+
+home:
+  title: "TissueField — Molecular Concentration Fields for Spatial Transcriptomics"
+  description: >
+    Computes steady-state molecular concentration fields from discrete mRNA
+    transcript or protein detection coordinates using a physically motivated
+    diffusion-clearance model. Supports finite-difference, Green's function,
+    and kernel density estimation solvers with exact boundary conditions.
+  links:
+    - text: "RaredonLab on GitHub"
+      href: https://github.com/RaredonLab
+    - text: "TissueMask (companion package)"
+      href: https://github.com/RaredonLab/TissueMask
+
+navbar:
+  structure:
+    left:  [intro, reference, articles, news]
+    right: [github]
+  components:
+    github:
+      icon: fab fa-github fa-lg
+      href: https://github.com/RaredonLab/TissueField
+      aria-label: GitHub
+
+reference:
+  - title: "Core function"
+    desc: >
+      The primary exported function for estimating concentration fields.
+    contents:
+      - estimate_concentration_field
+  - title: "Utilities"
+    desc: Helper functions for post-processing and visualisation.
+    contents:
+      - field_to_df
+      - plot_concentration_field
+      - sweep_diffusion_length
+  - title: "Package"
+    desc: Package-level documentation.
+    contents:
+      - TissueField-package
+
+articles:
+  - title: "Vignettes"
+    navbar: Vignettes
+    contents:
+      - getting-started
+      - solver-guide
+      - parameter-tuning
+      - complete-reference
+
+news:
+  releases:
+    - text: "TissueField 0.1.0"
+      href: https://github.com/RaredonLab/TissueField/releases/tag/v0.1.0
+
+footer:
+  structure:
+    left: developed_by
+    right: built_with

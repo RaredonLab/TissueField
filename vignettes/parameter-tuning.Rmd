@@ -1,0 +1,390 @@
+---
+title: "Parameter Tuning Guide"
+output: rmarkdown::html_vignette
+vignette: >
+  %\VignetteIndexEntry{Parameter Tuning Guide}
+  %\VignetteEngine{knitr::rmarkdown}
+  %\VignetteEncoding{UTF-8}
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo      = TRUE,
+  warning   = FALSE,
+  message   = FALSE,
+  fig.align = "center",
+  fig.width = 8,
+  fig.height = 4.5
+)
+```
+
+```{r libs}
+library(TissueField)
+library(sf)
+library(ggplot2)
+library(patchwork)
+set.seed(2024)
+```
+
+This vignette covers the parameters that most strongly affect the output of `estimate_concentration_field()`. They are ordered from most impactful to least:
+
+1. **Diffusion length $L$** — controls spatial scale (shape)
+2. **$D$ and $\lambda$ independently** — control amplitude
+3. **`weight_col` (UMI weighting)** — rescales source strength per transcript
+4. **`include_external`** — whether transcripts outside the mask contribute
+5. **`grid_resolution`** — accuracy vs. speed
+6. **`normalize` and `log_transform`** — output rescaling
+
+---
+
+## Shared setup
+
+```{r setup-tissue}
+# Kidney-bean mask
+in_bean <- function(x, y)
+  (x/9)^2 + (y/7)^2 < 1 & sqrt((x - 4.5)^2 + y^2) >= 3.5
+
+cands <- data.frame(x = runif(20000, -11, 11), y = runif(20000, -9, 9))
+tissue_pts <- cands[in_bean(cands$x, cands$y), ][1:3000, ]
+
+if (requireNamespace("TissueMask", quietly = TRUE)) {
+  mask <- TissueMask::fit_spatial_mask(
+    tissue_pts, method = "raster",
+    raster_resolution = 200L, raster_sigma = 0.8,
+    raster_threshold  = 0.15, verbose = FALSE
+  )
+} else {
+  pts_sf <- st_as_sf(tissue_pts, coords = c("x", "y"))
+  mask   <- st_convex_hull(st_union(pts_sf))
+}
+mu <- st_union(mask)
+
+inside_fn <- function(d)
+  as.logical(st_within(st_as_sf(d, coords = c("x","y")), mu, sparse = FALSE)[,1])
+
+tc_cl <- data.frame(x = rnorm(280, -3, 1.2), y = rnorm(280, 3.5, 0.9))
+tc_bg_all <- data.frame(x = runif(600, -10, 10), y = runif(600, -8, 8))
+tc <- rbind(tc_cl[inside_fn(tc_cl), ],
+            tc_bg_all[inside_fn(tc_bg_all), ][1:80, ])
+tc$umi <- c(rpois(sum(inside_fn(tc_cl)), 18),
+            rpois(80, 3))
+```
+
+---
+
+## 1. Diffusion length L
+
+$L = \sqrt{D/\lambda}$ is the single most important parameter. It determines **how far a transcript's influence extends** in the tissue.
+
+Use `diffusion_length` to set $L$ directly, bypassing the $D$/$\lambda$ decomposition:
+
+```{r L-sweep, fig.height=9, fig.width=8}
+L_vals <- c(0.5, 1.5, 3.5, 7.0, 12.0, 20.0)
+
+L_plots <- lapply(L_vals, function(Lv) {
+  r  <- estimate_concentration_field(
+    mask, tc, diffusion_length = Lv, D = 1,
+    method = "fd", fd_solver = "direct",
+    grid_resolution = 128L, verbose = FALSE
+  )
+  df  <- field_to_df(r)
+  rng <- range(df$field, na.rm = TRUE)
+  df$fn <- (df$field - rng[1]) / diff(rng)
+  ggplot(df, aes(x = x, y = y, fill = fn)) +
+    geom_raster(interpolate = TRUE) +
+    scale_fill_viridis_c(option = "magma", limits = c(0, 1),
+                          name = "Norm.\nConc.", na.value = "transparent") +
+    coord_equal() + theme_minimal(base_size = 8) +
+    labs(title = sprintf("L = %g", Lv),
+         subtitle = sprintf("lambda = %.4f", 1/Lv^2),
+         x = NULL, y = NULL)
+})
+
+wrap_plots(L_plots, nrow = 2) +
+  plot_annotation(
+    title    = "Diffusion Length Sweep (normalised per panel)",
+    subtitle = "Small L: tight peaks  |  Large L: tissue-wide field",
+    theme    = theme(plot.title    = element_text(face = "bold", size = 12),
+                     plot.subtitle = element_text(size = 9, color = "grey40"))
+  )
+```
+
+```{r L-peak-table, echo=FALSE}
+peaks <- sapply(L_vals, function(Lv) {
+  r <- estimate_concentration_field(
+    mask, tc, diffusion_length = Lv, D = 1,
+    method = "fd", fd_solver = "direct",
+    grid_resolution = 128L, verbose = FALSE
+  )
+  max(r$field, na.rm = TRUE)
+})
+knitr::kable(
+  data.frame(L = L_vals, lambda = round(1/L_vals^2, 5),
+             peak_concentration = signif(peaks, 4)),
+  caption = "Peak concentration vs diffusion length (D=1 throughout)"
+)
+```
+
+**How to choose L in practice:**
+
+| Scenario | Suggested L |
+|---|---|
+| Tight spatial domains, distinguish adjacent clusters | 10--20% of inter-cluster distance |
+| Moderate-range signalling (e.g. paracrine cytokines) | 20--50% of tissue diameter |
+| Tissue-wide gradient (e.g. oxygen, morphogens) | > 50% of tissue diameter |
+| Quick exploration | Try L = 1, 3, 10 and compare |
+
+> **Shortcut**: use `sweep_diffusion_length(c(1, 3, 10), mask, tc)` to get a combined data frame for all three values.
+
+---
+
+## 2. D and lambda: shape vs amplitude
+
+**The spatial shape of the field depends only on $L = \sqrt{D/\lambda}$.** Changing $D$ and $\lambda$ while keeping their ratio constant produces identical spatial patterns — only the amplitude changes, scaling as $C \propto 1/D$.
+
+```{r DL-fixed, fig.height=4, fig.width=9}
+# L = 2 throughout: D * lambda = 1/L^2 = 0.25
+dl_cases <- list(
+  list(D = 0.1,  lam = 0.025, lbl = "D=0.1,  lam=0.025"),
+  list(D = 1.0,  lam = 0.25,  lbl = "D=1,    lam=0.25"),
+  list(D = 5.0,  lam = 1.25,  lbl = "D=5,    lam=1.25"),
+  list(D = 20.0, lam = 5.0,   lbl = "D=20,   lam=5")
+)
+
+dl_plots <- lapply(dl_cases, function(co) {
+  r  <- estimate_concentration_field(
+    mask, tc, D = co$D, lambda = co$lam,
+    method = "fd", fd_solver = "direct",
+    grid_resolution = 128L, verbose = FALSE
+  )
+  pk <- signif(max(r$field, na.rm = TRUE), 3)
+  df <- field_to_df(r)
+  ggplot(df, aes(x = x, y = y, fill = field)) +
+    geom_raster(interpolate = TRUE) +
+    scale_fill_viridis_c(option = "magma", name = "Conc.",
+                          na.value = "transparent") +
+    coord_equal() + theme_minimal(base_size = 8) +
+    labs(title    = co$lbl,
+         subtitle = sprintf("L=2 fixed | peak=%g", pk),
+         x = NULL, y = NULL)
+})
+
+wrap_plots(dl_plots, nrow = 1) +
+  plot_annotation(
+    title    = "Fixed L=2, Varying D and lambda",
+    subtitle = "SHAPE is identical. Amplitude scales as 1/D.",
+    theme    = theme(plot.title    = element_text(face = "bold", size = 12),
+                     plot.subtitle = element_text(size = 9, color = "grey40"))
+  )
+```
+
+**Practical implication:** When fitting to data, first determine $L$ (the spatial scale), then fix $D$ based on biophysical priors (or leave at 1 if only relative concentrations matter). $\lambda$ is then determined as $\lambda = D/L^2$.
+
+---
+
+## 3. UMI weighting (weight_col)
+
+Each transcript can carry a per-molecule count (UMI) that scales its contribution to the source term. Pass the column name to `weight_col`:
+
+```{r umi-run}
+# Without weighting
+res_unweighted <- estimate_concentration_field(
+  mask, tc, D = 1, lambda = 0.2,
+  method = "fd", grid_resolution = 128L, verbose = FALSE
+)
+
+# With UMI weighting
+res_weighted <- estimate_concentration_field(
+  mask, tc, D = 1, lambda = 0.2, weight_col = "umi",
+  method = "fd", grid_resolution = 128L, verbose = FALSE
+)
+```
+
+```{r umi-plot, fig.height=4}
+panel2 <- function(result, title = "") {
+  df <- field_to_df(result)
+  ggplot(df, aes(x = x, y = y, fill = field)) +
+    geom_raster(interpolate = TRUE) +
+    scale_fill_viridis_c(option = "magma", name = "Conc.",
+                          na.value = "transparent") +
+    coord_equal() + theme_minimal(base_size = 9) +
+    labs(title = title, x = "X", y = "Y") +
+    theme(plot.title = element_text(face = "bold"))
+}
+
+(panel2(res_unweighted, "Unweighted (all transcripts = 1)") +
+ panel2(res_weighted,   "UMI-weighted (cluster UMI ~18, bg ~3)")) +
+plot_annotation(
+  title = "Effect of UMI Weighting",
+  theme = theme(plot.title = element_text(face = "bold", size = 12))
+)
+```
+
+```{r umi-stats, echo=FALSE}
+knitr::kable(data.frame(
+  Version     = c("Unweighted", "UMI-weighted"),
+  Peak        = signif(c(max(res_unweighted$field, na.rm = TRUE),
+                         max(res_weighted$field, na.rm = TRUE)), 4),
+  Total_source = c(sum(res_unweighted$sources, na.rm = TRUE),
+                   sum(res_weighted$sources, na.rm = TRUE))
+), caption = "Peak concentration and total source strength")
+```
+
+**When to use `weight_col`:** When your data has UMI counts that reflect true mRNA abundance differences. Unweighted fields treat each detected molecule equally; weighted fields amplify contribution from high-UMI transcripts (often genuine high-expressers).
+
+---
+
+## 4. External transcripts (include_external)
+
+By default, transcripts outside the mask are discarded. Setting `include_external = TRUE` includes them as sources, which can create elevated concentration near the tissue boundary from external signal.
+
+```{r external-run}
+# Add some transcripts outside the mask
+tc_ext <- rbind(tc,
+  data.frame(x = c(-12, -11, 13), y = c(0, 5, -2), umi = c(50, 40, 30)))
+
+res_excl <- estimate_concentration_field(
+  mask, tc_ext, D = 1, lambda = 0.2,
+  include_external = FALSE,
+  grid_resolution = 128L, verbose = FALSE
+)
+
+res_incl <- estimate_concentration_field(
+  mask, tc_ext, D = 1, lambda = 0.2,
+  include_external = TRUE,
+  grid_resolution = 128L, verbose = FALSE
+)
+```
+
+```{r external-plot, fig.height=4}
+(panel2(res_excl, "include_external = FALSE (default)") +
+ panel2(res_incl, "include_external = TRUE")) +
+plot_annotation(
+  title    = "Effect of include_external",
+  subtitle = "External sources can elevate concentration near edges",
+  theme    = theme(plot.title    = element_text(face = "bold", size = 12),
+                   plot.subtitle = element_text(size = 9, color = "grey40"))
+)
+```
+
+---
+
+## 5. Grid resolution
+
+`grid_resolution` sets the number of cells per axis ($N \times N$). Higher resolution gives smoother, more accurate fields but increases memory and solve time.
+
+```{r resolution-run}
+res_times <- sapply(c(64L, 128L, 256L, 512L), function(N) {
+  t0 <- proc.time()["elapsed"]
+  estimate_concentration_field(
+    mask, tc, D = 1, lambda = 0.2,
+    method = "fd", fd_solver = "direct",
+    grid_resolution = N, verbose = FALSE
+  )
+  proc.time()["elapsed"] - t0
+})
+```
+
+```{r resolution-table, echo=FALSE}
+knitr::kable(data.frame(
+  N           = c(64, 128, 256, 512),
+  Grid_cells  = c(64, 128, 256, 512)^2,
+  Time_s      = round(res_times, 2)
+), caption = "Wall time vs grid resolution (direct solver)")
+```
+
+```{r resolution-plot, fig.height=3.5, fig.width=9}
+res_low  <- estimate_concentration_field(
+  mask, tc, D=1, lambda=0.2, method="fd",
+  grid_resolution = 32L, verbose = FALSE
+)
+res_med  <- estimate_concentration_field(
+  mask, tc, D=1, lambda=0.2, method="fd",
+  grid_resolution = 128L, verbose = FALSE
+)
+res_high <- estimate_concentration_field(
+  mask, tc, D=1, lambda=0.2, method="fd",
+  grid_resolution = 256L, verbose = FALSE
+)
+
+(panel2(res_low,  "N = 32") +
+ panel2(res_med,  "N = 128") +
+ panel2(res_high, "N = 256")) +
+plot_annotation(
+  title = "Grid Resolution Comparison",
+  theme = theme(plot.title = element_text(face = "bold", size = 12))
+)
+```
+
+**Practical guidance:**
+
+- `N = 64--128`: fast exploration, reasonable accuracy
+- `N = 256`: good balance; default
+- `N = 512+`: high-resolution publication figures; use `fd_solver = "iterative"` or `method = "green"` to manage memory
+
+---
+
+## 6. Normalise and log-transform
+
+Two output rescaling options:
+
+- `normalize = TRUE`: linearly rescales the field to $[0, 1]$. Useful when comparing fields across genes with different expression levels.
+- `log_transform = TRUE`: applies `log1p()` after solving. Compresses wide dynamic range (useful for highly focal sources).
+
+```{r transform-plot, fig.height=4}
+res_raw  <- estimate_concentration_field(
+  mask, tc, D = 1, lambda = 0.2, grid_resolution = 128L, verbose = FALSE
+)
+res_norm <- estimate_concentration_field(
+  mask, tc, D = 1, lambda = 0.2, normalize = TRUE,
+  grid_resolution = 128L, verbose = FALSE
+)
+res_log  <- estimate_concentration_field(
+  mask, tc, D = 1, lambda = 0.2, log_transform = TRUE,
+  grid_resolution = 128L, verbose = FALSE
+)
+
+(panel2(res_raw,  "Raw field") +
+ panel2(res_norm, "normalize = TRUE (field in [0,1])") +
+ panel2(res_log,  "log_transform = TRUE (log1p applied)")) +
+plot_annotation(
+  title = "Output Rescaling Options",
+  theme = theme(plot.title = element_text(face = "bold", size = 12))
+)
+```
+
+```{r transform-ranges, echo=FALSE}
+knitr::kable(data.frame(
+  Setting       = c("Raw", "normalize=TRUE", "log_transform=TRUE"),
+  Min           = round(sapply(list(res_raw, res_norm, res_log),
+                               function(r) min(r$field, na.rm = TRUE)), 5),
+  Max           = round(sapply(list(res_raw, res_norm, res_log),
+                               function(r) max(r$field, na.rm = TRUE)), 5)
+), caption = "Field range under different output options")
+```
+
+---
+
+## Parameter quick-reference
+
+```{r quickref, echo=FALSE}
+qr <- data.frame(
+  Parameter = c("diffusion_length", "D", "lambda", "weight_col",
+                "include_external", "grid_resolution", "normalize",
+                "log_transform", "boundary_condition", "fd_solver"),
+  Controls  = c("Spatial scale of field (shape)",
+                "Amplitude (C proportional to 1/D)",
+                "Clearance rate (determines L with D)",
+                "Per-transcript source weight",
+                "Whether to use off-mask transcripts",
+                "Grid density (N x N cells)",
+                "Rescale output to [0, 1]",
+                "Apply log1p() to output",
+                "Dirichlet (absorbing) or Neumann (reflecting)",
+                "Direct (LU) or iterative (SOR)"),
+  Default   = c("NULL (computed from D and lambda)", "1.0", "0.1",
+                "NULL", "FALSE", "256", "FALSE", "FALSE",
+                "dirichlet", "direct")
+)
+knitr::kable(qr)
+```
