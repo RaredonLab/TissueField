@@ -1,0 +1,34 @@
+Package: TissueField
+Title: Steady-State Molecular Concentration Fields for Spatial Transcriptomics
+Version: 0.1.0
+Authors@R: person("Raredon Laboratory", role = c("aut", "cre"),
+    email = "raredon@yale.edu")
+Description: Computes continuous steady-state molecular concentration fields
+    from discrete mRNA transcript or protein detection coordinates, using a
+    physically motivated diffusion-clearance model. Solves the screened
+    Poisson PDE (D * nabla^2 C - lambda * C + s = 0) via one of three
+    methods: finite-difference sparse linear system, Green's function FFT
+    convolution, or Gaussian kernel density estimation. Designed for use
+    with spatial transcriptomics and spatial proteomics data. Works
+    naturally with tissue masks produced by the TissueMask package.
+License: MIT + file LICENSE
+Encoding: UTF-8
+Roxygen: list(markdown = TRUE)
+RoxygenNote: 7.3.3
+Depends: R (>= 4.1.0)
+Imports:
+    sf (>= 1.0-0),
+    Matrix (>= 1.3-0),
+    stats,
+    parallel
+Suggests:
+    ggplot2,
+    patchwork,
+    testthat (>= 3.0.0),
+    knitr,
+    rmarkdown,
+    TissueMask
+Config/testthat/edition: 3
+VignetteBuilder: knitr
+URL: https://github.com/RaredonLab/TissueField
+BugReports: https://github.com/RaredonLab/TissueField/issues
