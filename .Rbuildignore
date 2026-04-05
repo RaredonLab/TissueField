@@ -1,0 +1,9 @@
+^spatial-modeling-with-claude$
+^_pkgdown\.yml$
+^pkgdown$
+^docs$
+^\.github$
+^.*\.Rproj$
+^\.Rproj\.user$
+^README\.Rmd$
+^LICENSE\.md$
